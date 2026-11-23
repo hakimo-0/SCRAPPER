@@ -1,0 +1,31 @@
+[server]
+# Always open the local dashboard in the default browser when it starts.
+headless = false
+runOnSave = true
+address = "127.0.0.1"
+
+[browser]
+gatherUsageStats = false
+
+[client]
+# This is a local end-user app: hide Streamlit's developer toolbar and Deploy action.
+toolbarMode = "minimal"
+
+[theme]
+base = "light"
+primaryColor = "#1769E0"
+backgroundColor = "#F7F9FC"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#172033"
+borderColor = "#DDE5F0"
+blueColor = "#1769E0"
+greenColor = "#138A5B"
+redColor = "#C73E4B"
+orangeColor = "#B96A00"
+baseRadius = "large"
+buttonRadius = "medium"
+showWidgetBorder = true
+dataframeHeaderBackgroundColor = "#EEF3F9"
+linkUnderline = false
+headingFontSizes = ["2.25rem", "1.55rem", "1.2rem"]
+headingFontWeights = [700, 650, 650]
