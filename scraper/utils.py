@@ -239,7 +239,8 @@ def extract_emails_from_html(html, base_url=""):
             if addr and "@" in addr and addr not in emails:
                 emails.append(addr)
         if base_url and re.search(
-            r"(impressum|kontakt|contact|über.?uns|ueber.?uns|about|impress|anbieter)",
+            r"(impressum|kontakt|contact|über.?uns|ueber.?uns|about|impress|anbieter|"
+            r"karriere|career|jobs?|ausbildung|bewerbung|recruiting|personal)",
             href.lower(),
         ):
             url = urljoin(base_url, href)

@@ -13,19 +13,31 @@ toolbarMode = "minimal"
 
 [theme]
 base = "light"
-primaryColor = "#1769E0"
+primaryColor = "#173B66"
 backgroundColor = "#F7F9FC"
-secondaryBackgroundColor = "#FFFFFF"
-textColor = "#172033"
-borderColor = "#DDE5F0"
-blueColor = "#1769E0"
-greenColor = "#138A5B"
+secondaryBackgroundColor = "#EEF2F7"
+textColor = "#182230"
+borderColor = "#D8E0EA"
+blueColor = "#245B8F"
+greenColor = "#168052"
 redColor = "#C73E4B"
-orangeColor = "#B96A00"
+orangeColor = "#A96800"
+yellowColor = "#A96800"
+grayColor = "#667085"
+violetColor = "#7057A3"
+chartCategoricalColors = ["#173B66", "#168052", "#A96800", "#7057A3", "#245B8F", "#667085"]
 baseRadius = "large"
 buttonRadius = "medium"
 showWidgetBorder = true
+showSidebarBorder = true
 dataframeHeaderBackgroundColor = "#EEF3F9"
 linkUnderline = false
-headingFontSizes = ["2.25rem", "1.55rem", "1.2rem"]
+headingFontSizes = ["1.85rem", "1.4rem", "1.15rem"]
 headingFontWeights = [700, 650, 650]
+
+[theme.sidebar]
+backgroundColor = "#F1F4F8"
+secondaryBackgroundColor = "#FFFFFF"
+primaryColor = "#173B66"
+textColor = "#182230"
+borderColor = "#D8E0EA"

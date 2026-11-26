@@ -9,6 +9,7 @@ from scraper.aa_live import (
     parse_contact_text, parse_offer, search_offers,
 )
 from scraper.arbeitsagentur import SearchResult
+from scraper import job_state
 
 
 def test_parse_offer_aa_live():
@@ -163,3 +164,38 @@ def test_website_fallback_keeps_all_company_emails_and_uses_city_in_cache_key():
     assert website_finder.find_website.call_args_list == [
         call("ACME GmbH", "Berlin"), call("ACME GmbH", "Hamburg"),
     ]
+
+
+def test_aa_resume_uses_saved_offer_queue_without_searching_again(monkeypatch, tmp_path):
+    monkeypatch.setattr(job_state, "STATE_DIR", tmp_path)
+    params = {"angebotsart": 4, "locations": ["Berlin"], "was": "IT", "umkreis": 0,
+              "seit": None, "year": "Alle", "max_results": 0, "headed": False}
+    paused = ExtractionJob(params, output_dir=str(tmp_path))
+    paused.offers = [
+        {"refnr": "1", "firma": "Done GmbH", "email": "done@example.test", "person": "",
+         "adresse": "Berlin", "beginn": "", "telefonnummer": ""},
+        {"refnr": "2", "firma": "Next GmbH", "email": "", "person": "",
+         "adresse": "Berlin", "beginn": "", "telefonnummer": ""},
+    ]
+    paused.rows = [dict(paused.offers[0])]
+    paused.processed = 1
+    paused.total = 2
+    paused.next_offer_index = 1
+    paused.next_location_index = 1
+    paused.locations_total = 1
+    paused.locations_completed = 1
+    paused._collection_complete = True
+    paused._persist("paused")
+
+    contacts = Mock()
+    contacts.fetch.return_value = {"email": "jobs@next.example", "person": "Frau Next", "telefonnummer": ""}
+    resumed = ExtractionJob(params, output_dir=str(tmp_path), resume=True)
+    with patch("scraper.aa_live.search_offers") as search, patch(
+        "scraper.aa_live.BrowserContacts", return_value=contacts
+    ), patch("scraper.aa_live.export_xlsx"):
+        resumed._run()
+
+    assert resumed.status == "done"
+    assert not search.called
+    assert [row["refnr"] for row in resumed.rows] == ["1", "2"]
+    assert resumed.rows[1]["email"] == "jobs@next.example"

@@ -79,11 +79,21 @@ class EmailFinder:
             data = r.json()
         except Exception:
             return None
+        tokens = self._keywords(company)
+        fallback = None
         for item in data.get("organic_results", []):
             link = item.get("link", "")
-            if link and not is_blocked_url(link):
+            if not link or is_blocked_url(link):
+                continue
+            domain = get_domain(link)
+            if tokens and any(token in domain for token in tokens):
                 return link
-        return None
+            # Do not blindly accept a directory, review or news result for a
+            # company with a distinctive name.  A result without a usable
+            # company token is only a last resort for very short names.
+            if not tokens and fallback is None:
+                fallback = link
+        return fallback
 
     def _guess_website(self, company, deadline=None):
         tokens = self._keywords(company)

@@ -5,7 +5,7 @@ from openpyxl import load_workbook
 
 from scraper.leads import (
     best_email, deobfuscate_text, decode_cfemail, normalise_firma, merge_leads,
-    export_leads_xlsx, EXCEL_COLUMNS, WebsiteEmailFinder,
+    export_leads_xlsx, EXCEL_COLUMNS, WebsiteEmailFinder, _extract_person,
 )
 
 
@@ -40,6 +40,12 @@ def test_decode_cfemail():
     key = 0x55
     enc = format(key, "02x") + "".join(format(ord(c) ^ key, "02x") for c in "test@example.com")
     assert decode_cfemail(enc) == "test@example.com"
+
+
+def test_extracts_name_only_when_public_contact_label_precedes_it():
+    assert _extract_person("Ansprechperson: Max Mustermann, E-Mail: max@betrieb.de") == "Max Mustermann"
+    assert _extract_person("Kontaktperson: Bewerbungs Team") == ""
+    assert _extract_person("Über uns: Max Mustermann ist Geschäftsführer") == ""
 
 
 def test_merge_leads():
@@ -144,3 +150,25 @@ def test_website_finder_stops_at_company_time_limit():
     assert result["emails"] == []
     assert result["timed_out"] is True
     assert http.calls == 1
+
+
+def test_website_finder_reads_same_site_javascript_email_obfuscation():
+    class Http:
+        def get_text(self, url, **_kwargs):
+            pages = {
+                "https://acme.de": (
+                    '<html><a href="/kontakt">Kontakt</a>'
+                    '<script src="/assets/contact.js"></script></html>'
+                ),
+                "https://acme.de/assets/contact.js": (
+                    "const jobs = 'jobs' + '@' + 'acme.de'; "
+                    'const info = "info\\u0040acme.de";'
+                ),
+            }
+            return pages.get(url)
+
+    finder = WebsiteEmailFinder(session=Http(), max_pages=2, max_scripts=2, log=lambda _message: None)
+
+    result = finder.find("https://acme.de")
+
+    assert result["emails"] == ["jobs@acme.de", "info@acme.de"]

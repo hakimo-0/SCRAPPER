@@ -1,6 +1,7 @@
 from unittest.mock import patch
 
 from scraper.generic_job import GenericExtractionJob, _generic_collect
+from scraper import job_state
 
 
 def test_generic_job_normalizes_company_name_and_saves_output():
@@ -54,6 +55,76 @@ def test_google_maps_collects_each_selected_city_separately():
     progress = job.snapshot_progress()
     assert progress["locations_total"] == 2
     assert progress["locations_completed"] == 2
+
+
+def test_google_maps_searches_every_company_in_every_selected_city():
+    job = GenericExtractionJob({"source": "google_maps"})
+
+    with patch("scraper.google_maps.places_text_search", return_value=[]) as search:
+        _generic_collect(
+            {
+                "source": "google_maps",
+                "keywords": ["McDonald's", "Burger King", "KFC"],
+                "locations": ["Berlin", "Hamburg"],
+                "api_key": "test-key",
+            },
+            job,
+        )
+
+    assert [(call.args[0], call.args[1]) for call in search.call_args_list] == [
+        ("McDonald's", "Berlin"), ("McDonald's", "Hamburg"),
+        ("Burger King", "Berlin"), ("Burger King", "Hamburg"),
+        ("KFC", "Berlin"), ("KFC", "Hamburg"),
+    ]
+    assert job.snapshot_progress()["locations_total"] == 6
+
+
+def test_google_maps_batch_records_query_completeness():
+    job = GenericExtractionJob({"source": "google_maps"})
+
+    def search(_term, _city, status_callback, **_kwargs):
+        status_callback("complete", "provider pages exhausted")
+        return []
+
+    with patch("scraper.google_maps.places_text_search", side_effect=search):
+        _generic_collect(
+            {
+                "source": "google_maps",
+                "keywords": ["Hotel", "Restaurant"],
+                "locations": ["Bonn", "Köln"],
+                "api_key": "test-key",
+            },
+            job,
+        )
+
+    assert len(job.collection_statuses) == 4
+    assert job.snapshot_progress()["search_completeness"] == "complete"
+    assert job.snapshot_progress()["search_status_counts"]["complete"] == 4
+
+
+def test_google_maps_deduplicates_same_place_returned_by_multiple_queries():
+    job = GenericExtractionJob({
+        "source": "google_maps", "delay": 0, "guess_websites": False,
+    })
+    same_place = {
+        "name": "Bonn Hotel",
+        "street": "Hauptstrasse 1",
+        "zip": "53111",
+        "city": "Bonn",
+        "url": "https://www.google.com/maps/place/?q=place_id:123",
+        "source": "Google Maps",
+    }
+
+    with patch(
+        "scraper.generic_job._generic_collect",
+        return_value=([same_place, dict(same_place)], "Google Maps"),
+    ), patch("scraper.leads.export_leads_xlsx"):
+        job._run()
+
+    assert job.status == "done"
+    assert job.total == 1
+    assert len(job.snapshot_rows()) == 1
+    assert job.snapshot_rows()[0]["source"] == "Google Maps"
 
 
 def test_azubiyo_collect_uses_keyword_city_search_and_page_limit():
@@ -147,7 +218,7 @@ def test_generic_job_uses_each_row_city_for_website_lookup():
     assert job.status == "done"
 
 
-def test_google_maps_skips_domain_guessing_for_places_without_website():
+def test_google_maps_looks_up_missing_websites_but_rejects_blocked_portals():
     job = GenericExtractionJob({"source": "google_maps", "delay": 0})
     leads = [
         {
@@ -165,7 +236,7 @@ def test_google_maps_skips_domain_guessing_for_places_without_website():
     ]
 
     with patch("scraper.generic_job._generic_collect", return_value=(leads, "Google Maps")), patch(
-        "scraper.email_finder.EmailFinder.find_website"
+        "scraper.email_finder.EmailFinder.find_website", return_value=""
     ) as guess, patch(
         "scraper.leads.WebsiteEmailFinder.find",
         return_value={"emails": ["info@hotel-tanger.ma"], "person": ""},
@@ -173,7 +244,7 @@ def test_google_maps_skips_domain_guessing_for_places_without_website():
         job._run()
 
     assert job.status == "done"
-    assert not guess.called
+    assert guess.call_count == 2
     assert find.call_count == 1
     assert job.rows[0]["email"] == "info@hotel-tanger.ma"
     assert job.rows[1]["website"] == ""
@@ -182,7 +253,9 @@ def test_google_maps_skips_domain_guessing_for_places_without_website():
 
 
 def test_google_maps_parallel_email_extraction_keeps_row_order():
-    job = GenericExtractionJob({"source": "google_maps", "delay": 0, "email_workers": 4})
+    job = GenericExtractionJob({
+        "source": "google_maps", "delay": 0, "email_workers": 4, "guess_websites": False,
+    })
     leads = [
         {
             "name": f"Hotel {index}",
@@ -209,3 +282,63 @@ def test_google_maps_parallel_email_extraction_keeps_row_order():
     assert job.rows[0]["email"] == "info@hotel0.ma"
     assert job.rows[1]["email"] == ""
     assert not guess.called
+
+
+def test_generic_resume_continues_from_the_next_saved_city(monkeypatch, tmp_path):
+    monkeypatch.setattr(job_state, "STATE_DIR", tmp_path)
+    params = {
+        "source": "google_maps", "keyword": "IT Unternehmen",
+        "locations": ["Berlin", "Hamburg"], "api_key": "test-key", "delay": 0,
+    }
+    first = GenericExtractionJob(params, output_dir=str(tmp_path))
+
+    def pause_after_berlin(_query, city, **_kwargs):
+        if city == "Berlin":
+            first.request_pause()
+            return [{"name": "Berlin GmbH", "city": city, "url": "https://maps/berlin"}]
+        raise AssertionError("the first run must not start Hamburg after pause")
+
+    with patch("scraper.google_maps.places_text_search", side_effect=pause_after_berlin):
+        first._run()
+
+    assert first.status == "paused"
+
+    resumed = GenericExtractionJob(params, output_dir=str(tmp_path), resume=True)
+    with patch("scraper.google_maps.places_text_search", return_value=[
+        {"name": "Hamburg GmbH", "city": "Hamburg", "url": "https://maps/hamburg"}
+    ]) as search, patch("scraper.email_finder.EmailFinder.find_website", return_value=""), patch(
+        "scraper.leads.export_leads_xlsx"
+    ):
+        resumed._run()
+
+    assert resumed.status == "done"
+    assert [call.args[1] for call in search.call_args_list] == ["Hamburg"]
+    assert [row["firma"] for row in resumed.rows] == ["Berlin GmbH", "Hamburg GmbH"]
+
+
+def test_google_maps_resume_marks_legacy_query_status_as_unconfirmed(monkeypatch, tmp_path):
+    monkeypatch.setattr(job_state, "STATE_DIR", tmp_path)
+    params = {
+        "source": "google_maps",
+        "keywords": ["Hotel"],
+        "locations": ["Bonn", "Köln"],
+        "api_key": "test-key",
+    }
+    job_state.save("google_maps", {
+        "source": "google_maps",
+        "status": "paused",
+        "params": params,
+        "collection_next_index": 1,
+        "collection_leads": [],
+        "rows": [],
+        "processed": 0,
+        "total": 0,
+        "phase": "collecting",
+    })
+
+    job = GenericExtractionJob(params, output_dir=str(tmp_path), resume=True)
+
+    assert job._load_existing_state()
+    progress = job.snapshot_progress()
+    assert progress["search_completeness"] == "incomplete"
+    assert progress["search_status_counts"]["incomplete"] == 1

@@ -2,6 +2,7 @@
 """Common lead model: normalise, best email, merge/dedupe, Excel export, website finder."""
 from __future__ import annotations
 
+import html as html_lib
 import io
 import os
 import re
@@ -21,6 +22,9 @@ EXCEL_WIDTHS = {"A": 55, "B": 30, "C": 55, "D": 55, "E": 55, "F": 55, "G": 55}
 EMAIL_PRIORITY = ["bewerbung", "karriere", "ausbildung", "jobs", "personal", "hr", "info", "kontakt"]
 
 PERSON_RE = re.compile(r"\b(Herr|Frau)\s+((?:Dr\.|Prof\.)?\s?[A-ZÄÖÜ][\w\-ÄÖÜäöüß]+(?:\s+[A-ZÄÖÜ][\w\-ÄÖÜäöüß]+){0,2})")
+PERSON_NAME_RE = re.compile(
+    r"^\s*[:\-–]?\s*([A-ZÄÖÜ][A-Za-zÄÖÜäöüß'’\-]+(?:\s+[A-ZÄÖÜ][A-Za-zÄÖÜäöüß'’\-]+){1,2})\b"
+)
 PATHS = ["/", "/impressum", "/kontakt", "/karriere", "/jobs", "/ausbildung", "/bewerbung"]
 
 # Obfuscation patterns -> real characters
@@ -31,6 +35,15 @@ OBFUSCATION = [
     (re.compile(r"\s*\(\s*dot\s*\)\s*", re.I), "."),
     (re.compile(r"\s*\[\s*dot\s*\]\s*", re.I), "."),
 ]
+
+CONTACT_PAGE_WORDS = (
+    "impressum", "kontakt", "contact", "karriere", "career", "jobs",
+    "ausbildung", "bewerbung", "recruiting", "personal", "unternehmen",
+)
+DEFAULT_CONTACT_PATHS = (
+    "/kontakt", "/impressum", "/contact", "/karriere", "/jobs",
+    "/ausbildung", "/bewerbung",
+)
 
 
 class Stopped(Exception):
@@ -158,20 +171,69 @@ def _extract_jsonld_emails(html: str) -> List[str]:
     return out
 
 
+def _decode_javascript_text(value: str) -> str:
+    """Decode the harmless JavaScript encodings commonly used for emails."""
+    text = html_lib.unescape(value or "")
+
+    def decode_hex(match):
+        try:
+            return chr(int(match.group(1), 16))
+        except (TypeError, ValueError):
+            return match.group(0)
+
+    text = re.sub(r"\\u([0-9a-fA-F]{4})", decode_hex, text)
+    text = re.sub(r"\\x([0-9a-fA-F]{2})", decode_hex, text)
+
+    def decode_char_codes(match):
+        values = match.group(1).split(",")
+        if not values or len(values) > 128:
+            return match.group(0)
+        try:
+            chars = [chr(int(value.strip(), 0)) for value in values]
+        except (TypeError, ValueError):
+            return match.group(0)
+        return "".join(chars) if all(0 <= ord(char) <= 0x10FFFF for char in chars) else match.group(0)
+
+    return re.sub(r"String\.fromCharCode\(\s*([0-9a-fA-FxX,\s]+)\s*\)", decode_char_codes, text)
+
+
+def _extract_javascript_emails(source: str) -> List[str]:
+    """Extract addresses from inline or linked JS without executing it."""
+    decoded = _decode_javascript_text(source)
+    # Common front-end obfuscation: 'jobs' + '@' + 'company.de'.
+    for match in re.finditer(
+        r"(?P<q1>['\"])(?P<local>[A-Za-z0-9._%+\-]+)(?P=q1)\s*\+\s*"
+        r"(?P<q2>['\"])@(?P=q2)\s*\+\s*"
+        r"(?P<q3>['\"])(?P<domain>[A-Za-z0-9.\-]+\.[A-Za-z]{2,})(?P=q3)",
+        decoded,
+    ):
+        decoded += " " + match.group("local") + "@" + match.group("domain")
+    return clean_emails(
+        deobfuscate_emails(decoded)
+        + clean_emails(re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,}", decoded))
+    )
+
+
 def _extract_person(text: str) -> str:
-    # Try near keywords
     ctx = text or ""
-    for kw in ("ansprechpartner", "ansprechperson", "kontaktperson", "personal", "geschäftsführer", "geschaeftsfuehrer"):
+    for kw in (
+        "ansprechpartner", "ansprechperson", "kontaktperson", "geschäftsführer",
+        "geschaeftsfuehrer", "kontakt:",
+    ):
         idx = ctx.lower().find(kw)
         if idx >= 0:
             window = ctx[idx: idx + 500]
             pm = PERSON_RE.search(window)
             if pm:
                 return f"{pm.group(1)} {pm.group(2).strip()}"
-    pm = PERSON_RE.search(ctx)
-    if pm:
-        # only accept if near a contact keyword? keep conservative: require keyword
-        pass
+            tail = window[len(kw):].lstrip()
+            tail = re.sub(r"^in\b", "", tail, flags=re.IGNORECASE).lstrip(" \t:,-–")
+            named = PERSON_NAME_RE.match(tail)
+            if named and not (set(named.group(1).casefold().split()) & {
+                "abteilung", "team", "bewerbung", "personal", "recruiting", "service",
+                "bewerbungs", "verwaltung", "zentrale", "firma",
+            }):
+                return named.group(1).strip()
     return ""
 
 
@@ -195,7 +257,8 @@ def _has_mx(domain: str) -> bool:
 class WebsiteEmailFinder:
     def __init__(self, session=None, delay: float = 0.5, max_pages: int = 4, log: Callable = print,
                  verify_mx: bool = False, stop: Optional[threading.Event] = None,
-                 timeout: float = 10.0, max_seconds: float = 60.0):
+                 pause: Optional[threading.Event] = None, timeout: float = 10.0,
+                 max_seconds: float = 60.0, max_scripts: int = 6):
         self.http = session or SafeSession()
         if session is None:
             self.http.throttle.delay = delay
@@ -203,13 +266,56 @@ class WebsiteEmailFinder:
         self.log = log
         self.verify_mx = verify_mx
         self.stop = stop
+        self.pause = pause
         self.timeout = timeout
         self.max_seconds = max(5.0, float(max_seconds or 60.0))
+        self.max_scripts = max(0, int(max_scripts or 0))
         self.cache: Dict[str, Dict[str, Any]] = {}
 
     def _check_stop(self):
-        if self.stop is not None and self.stop.is_set():
+        if ((self.stop is not None and self.stop.is_set())
+                or (self.pause is not None and self.pause.is_set())):
             raise Stopped()
+
+    @staticmethod
+    def _same_site_url(url: str, base_host: str) -> bool:
+        return (
+            url.startswith("http")
+            and _registrable_domain(urlparse(url).netloc) == _registrable_domain(base_host)
+        )
+
+    def _script_urls(self, html: str, page: str, base_host: str) -> List[str]:
+        urls: List[str] = []
+        soup = soup_of(html)
+        for script in soup.find_all("script", src=True):
+            candidate = urljoin(page, script.get("src", "")).split("#", 1)[0]
+            if self._same_site_url(candidate, base_host) and candidate not in urls:
+                urls.append(candidate)
+        return urls
+
+    def _page_emails(self, html: str, page: str, base_host: str, deadline: float,
+                     scripts_left: int) -> tuple[List[str], int]:
+        """Read HTML and a small number of same-site JS assets, never execute JS."""
+        data = extract_emails_from_html(html, base_url=page)
+        emails = list(data.get("emails", []))
+        emails += deobfuscate_emails(html)
+        emails += _extract_cfemails(html)
+        emails += _extract_jsonld_emails(html)
+        emails += _extract_javascript_emails(html)
+
+        scripts_checked = 0
+        for script_url in self._script_urls(html, page, base_host):
+            self._check_stop()
+            if scripts_checked >= scripts_left or time.monotonic() >= deadline:
+                break
+            remaining = deadline - time.monotonic()
+            script = self.http.get_text(
+                script_url, timeout=max(1.0, min(self.timeout, remaining)), attempts=1
+            )
+            scripts_checked += 1
+            if script:
+                emails += _extract_javascript_emails(script)
+        return clean_emails(emails), scripts_checked
 
     def find(self, website_url: str) -> Dict[str, Any]:
         url = normalize_website(website_url)
@@ -234,9 +340,10 @@ class WebsiteEmailFinder:
         found_emails: List[str] = []
         person = ""
         base_host = urlparse(start_url).netloc
-        # Only queue the two most useful fallbacks.  Blindly adding every
-        # known path made dead domains cost one timeout per path.
-        for p in ("/kontakt", "/impressum"):
+        # These are the pages where German employers normally publish contact
+        # addresses.  ``max_pages`` and the total time budget still stop this
+        # from becoming an unbounded site crawl.
+        for p in DEFAULT_CONTACT_PATHS:
             cand = urljoin(start_url + "/", p.lstrip("/"))
             if cand not in to_visit:
                 to_visit.append(cand)
@@ -255,15 +362,16 @@ class WebsiteEmailFinder:
                 for a in soup.find_all("a", href=True):
                     href = a["href"]
                     txt = (a.get_text(" ", strip=True) or "").lower()
-                    if any(k in (href.lower() + " " + txt) for k in ("impressum", "kontakt", "contact", "karriere", "jobs", "ausbildung", "bewerbung")):
+                    if any(k in (href.lower() + " " + txt) for k in CONTACT_PAGE_WORDS):
                         u = urljoin(start_url, href)
-                        if u.startswith("http") and _registrable_domain(urlparse(u).netloc) == _registrable_domain(base_host):
+                        if self._same_site_url(u, base_host):
                             if u not in to_visit:
                                 to_visit.append(u)
         except Exception:
             pass
 
         pages_attempted = 0
+        scripts_checked = 0
         while to_visit and pages_attempted < self.max_pages:
             self._check_stop()
             remaining = deadline - time.monotonic()
@@ -274,7 +382,7 @@ class WebsiteEmailFinder:
             if page in visited:
                 continue
             visited.append(page)
-            if _registrable_domain(urlparse(page).netloc) != _registrable_domain(base_host):
+            if not self._same_site_url(page, base_host):
                 continue
             # A failed /kontakt page counts as an attempt too; otherwise a dead
             # site can keep the loop busy for every queued candidate.
@@ -284,21 +392,16 @@ class WebsiteEmailFinder:
             )
             if not html:
                 continue
-            # mailto + text
-            data = extract_emails_from_html(html, base_url=page)
-            for e in data.get("emails", []):
-                found_emails.append(e)
-            # obfuscated + cloudflare + jsonld
-            found_emails += deobfuscate_emails(html)
-            found_emails += _extract_cfemails(html)
-            found_emails += _extract_jsonld_emails(html)
-            # also plain text regex on deobfuscated
-            found_emails += clean_emails(re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,}", deobfuscate_text(html)))
+            page_emails, scripts_used = self._page_emails(
+                html, page, base_host, deadline, self.max_scripts - scripts_checked,
+            )
+            scripts_checked += scripts_used
+            found_emails += page_emails
             # person
             if not person:
                 person = _extract_person(soup_of(html).get_text(" ", strip=True))
             # contact links
-            for link in data.get("contact_links", []):
+            for link in extract_emails_from_html(html, base_url=page).get("contact_links", []):
                 if link not in visited and link not in to_visit:
                     to_visit.append(link)
 
@@ -322,6 +425,9 @@ class WebsiteEmailFinder:
             filtered = [e for e in filtered if e in mx_ok]
 
         email = best_email(filtered)
+        if email:
+            filtered.remove(email)
+            filtered.insert(0, email)
         if not person:
             person = "Damen und Herren"
         result = {

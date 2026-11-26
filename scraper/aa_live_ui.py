@@ -6,19 +6,30 @@ téléchargement Excel). Utilisé par streamlit_app.py ET par agentur_app.py.
     start_job(params)        -> lance l'extraction en arrière-plan
     render_job()             -> affiche le panneau (à appeler à chaque exécution du script)
     render_captcha_dialog()  -> ouvre le captcha en modal, même depuis un autre onglet
+
+Pause / Reprise : l'état est persistant sur disque (output/job_states/arbeitsagentur.json),
+donc une reprise est possible même après fermeture du PC ou redémarrage de l'appli.
 """
 import inspect
 import os
+import threading
 
 import streamlit as st
 
 from scraper.aa_live import ExtractionJob, esc
+from scraper.job_state import load as load_state, clear as clear_state
+from scraper.i18n import DEFAULT_LANGUAGE, LANGUAGE_KEY, translate
 
 JOB_KEY = "aa_live_job"
+STATE_KEY = "arbeitsagentur"
 
 # `use_container_width` est déprécié dans les Streamlit récents : on s'adapte à la version.
 FULL = ({"width": "stretch"} if "width" in inspect.signature(st.button).parameters
         else {"use_container_width": True})
+
+
+def _t(text: str) -> str:
+    return translate(text, str(st.session_state.get(LANGUAGE_KEY, DEFAULT_LANGUAGE)))
 
 
 def get_job():
@@ -30,11 +41,27 @@ def job_running():
     return job is not None and job.status == "running"
 
 
-def start_job(params):
+def job_paused():
+    job = get_job()
+    return job is not None and job.status == "paused"
+
+
+def has_saved_state() -> bool:
+    state = load_state(STATE_KEY)
+    return bool(state and state.get("status") in ("paused", "pausing", "stopped", "running", "collecting", "extracting", "error"))
+
+
+def clear_saved_state():
+    clear_state(STATE_KEY)
+
+
+def start_job(params, resume: bool = False):
     """Démarre une extraction (ignoré si une est déjà en cours)."""
     if job_running():
         return get_job()
-    job = ExtractionJob(params)
+    # The job restores its own durable queue.  Pre-loading only the finished
+    # rows here used to make it re-run the source search from the beginning.
+    job = ExtractionJob(params, resume=resume)
     st.session_state[JOB_KEY] = job
     job.start()
     return job
@@ -55,13 +82,18 @@ def _render_log(job):
 
 def _render_progress(job):
     rows = list(job.rows)
-    ok = sum(1 for r in rows if r["email"])
+    ok = sum(1 for r in rows if r.get("email"))
     c1, c2, c3 = st.columns(3)
-    c1.metric("Verarbeitet", f"{job.processed}/{job.total or '…'}")
-    c2.metric("Mit E-Mail", ok)
-    c3.metric("Ohne E-Mail", len(rows) - ok)
+    c1.metric(_t("Verarbeitet"), f"{job.processed}/{job.total or '…'}")
+    c2.metric(_t("Mit E-Mail"), ok)
+    c3.metric(_t("Ohne E-Mail"), len(rows) - ok)
     if job.total:
         st.progress(min(job.processed / job.total, 1.0))
+    if job.paused.is_set():
+        if job.status == "paused":
+            st.info(_t("Pause – état sauvegardé. Reprise possible à tout moment."))
+        else:
+            st.info(_t("Pause demandée – l'offre en cours est sauvegardée avant l'arrêt."))
 
 
 def render_captcha_dialog():
@@ -75,33 +107,30 @@ def render_captcha_dialog():
     if job is None or job.status != "running" or job.captcha_png is None:
         return
 
-    @st.dialog("Captcha bestätigen", width="large", dismissible=False)
+    @st.dialog(_t("Captcha bestätigen"), width="large", dismissible=False)
     def _dialog():
         st.markdown(
-            "Die **Bundesagentur für Arbeit** schützt die Kontaktdaten mit einer "
-            "Sicherheitsabfrage."
+            _t("Die Bundesagentur für Arbeit schützt die Kontaktdaten mit einer Sicherheitsabfrage.")
         )
         st.caption(
-            "Bitte die Zeichen aus dem Bild eingeben. Danach läuft die Extraktion "
-            "automatisch weiter. Ist das Bild unlesbar, „Abbrechen“ drücken und die "
-            "Firma erneut starten."
+            _t("Bitte die Zeichen aus dem Bild eingeben. Danach läuft die Extraktion automatisch weiter. Ist das Bild unlesbar, „Abbrechen“ drücken und die Firma erneut starten.")
         )
         try:
             st.image(job.captcha_png, width=520)
         except Exception:
-            st.error("Captcha-Bild konnte nicht angezeigt werden – bitte 'Abbrechen' drücken.")
+            st.error(_t("Captcha-Bild konnte nicht angezeigt werden – bitte 'Abbrechen' drücken."))
         with st.form("aa_captcha_dialog_form", clear_on_submit=True):
             answer = st.text_input(
-                "Dargestellte Zeichen",
-                placeholder="Zeichen aus dem Bild",
+                _t("Dargestellte Zeichen"),
+                placeholder=_t("Zeichen aus dem Bild"),
                 label_visibility="collapsed",
             )
             c1, c2 = st.columns(2)
-            send = c1.form_submit_button("Senden", type="primary", **FULL)
-            cancel = c2.form_submit_button("Abbrechen", **FULL)
+            send = c1.form_submit_button(_t("Senden"), type="primary", **FULL)
+            cancel = c2.form_submit_button(_t("Abbrechen"), **FULL)
         if send:
             if not (answer or "").strip():
-                st.warning("Bitte die Zeichen aus dem Bild eingeben.")
+                st.warning(_t("Bitte die Zeichen aus dem Bild eingeben."))
             else:
                 job.answer_captcha(answer)
                 st.rerun()
@@ -116,54 +145,97 @@ def render_job(new_job_button=True):
     """Affiche le panneau du job courant. Ne fait rien s'il n'y a pas de job."""
     job = get_job()
     if job is None:
+        # Aucun job en mémoire : propose la reprise s'il y a un état sauvegardé.
+        if has_saved_state():
+            state = load_state(STATE_KEY)
+            st.warning(
+                f"{_t('Eine vorherige Jobbörse-Extraktion ist gespeichert.')} "
+                f"({state.get('processed', 0)}/{state.get('total', '?')} {_t('Verarbeitet')})"
+            )
+            c1, c2, c3 = st.columns(3)
+            if c1.button(_t("Reprise"), key="aa_resume_saved", type="primary", icon=":material/play_arrow:"):
+                start_job(state.get("params", {}), resume=True)
+                st.rerun()
+            if c2.button(_t("Neue recherche"), key="aa_new_saved"):
+                clear_saved_state()
+                st.rerun()
+            if c3.button(_t("Supprimer l'état"), key="aa_clear_saved"):
+                clear_saved_state()
+                st.rerun()
         return
-    # This snapshot controls whether the live fragment should auto-refresh.
-    # It must be set before the decorator is evaluated.
-    captcha_pending = job.captcha_png is not None
+
     was_running = job.status == "running"
+    was_paused = job.status in ("paused", "error")
 
     # Rafraîchissement automatique pendant l'extraction (sauf pendant la saisie du captcha).
-    @st.fragment(run_every=(1 if was_running and not captcha_pending else None))
+    captcha_pending = job.captcha_png is not None
+
+    @st.fragment(run_every=(1 if job.status == "running" and not captcha_pending else None),
+                 key="aa_live_panel")
     def live():
         j = get_job()
         if j.status == "running":
-            st.markdown("#### Daten werden extrahiert…")
-            st.caption("Verbinde mit **Arbeitsagentur** …")
+            st.markdown(f"#### {_t('Daten werden extrahiert…')}")
+            st.caption(f"{_t('Verbinde mit')} **Arbeitsagentur** …")
+        elif j.status == "paused":
+            st.status(f"Jobbörse : {_t('en pause')}", state="running", type="compact")
         elif j.status == "done":
-            st.success("Die Daten wurden erfolgreich extrahiert.")
+            st.success(_t("Die Daten wurden erfolgreich extrahiert."))
         elif j.status == "stopped":
-            st.warning("Process stopped.")
+            st.warning(_t("Process stopped."))
         else:
-            st.error("Extraktion mit Fehler beendet.")
+            st.error(_t("Extraktion mit Fehler beendet."))
         _render_progress(j)
         _render_log(j)
         if j.status == "running" and j.captcha_png is not None:
             st.warning(
-                "🔐 Captcha wartet – bitte im Eingabefenster die Zeichen eingeben. "
-                "Die Extraktion läuft nach dem Senden automatisch weiter."
+                f"🔐 {_t('Captcha wartet – bitte im Eingabefenster die Zeichen eingeben. Die Extraktion läuft nach dem Senden automatisch weiter.')}"
             )
-            # Only trigger a full-app rerun when the dialog is not open yet.
-            # Without this guard every rerun would immediately rerun again
-            # and the captcha form would never be displayed.
             if not captcha_pending:
                 st.rerun(scope="app")
-        if j.status != "running" and was_running:
-            st.rerun(scope="app")      # passage en mode « terminé »
+        if j.status not in ("running", "paused", "error") and (was_running or was_paused):
+            st.rerun(scope="app")
 
     live()
+    job = get_job()
 
     if job.status == "running":
-        if st.button("Stop", type="primary", key="aa_stop", **FULL):
+        c1, c2 = st.columns(2)
+        if c1.button(_t("Pause"), type="secondary", key="aa_pause", icon=":material/pause:"):
+            job.request_pause()
+            st.rerun()
+        if c2.button(_t("Stop"), type="primary", key="aa_stop", icon=":material/stop_circle:"):
             job.request_stop()
             st.rerun()
-    else:
-        c1, c2 = st.columns(2)
-        c1.download_button(
-            "⬇ Download (Excel)", data=job.excel_bytes(),
-            file_name=os.path.basename(job.autosave_path),
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="aa_download", disabled=not job.rows, **FULL)
-        if new_job_button and c2.button("Ergebnis schließen", key="aa_close", **FULL):
-            del st.session_state[JOB_KEY]
+        return
+
+    if job.status in ("paused", "error"):
+        c1, c2, c3 = st.columns(3)
+        if c1.button(_t("Reprise"), type="primary", key="aa_resume", icon=":material/play_arrow:"):
+            job.paused.clear()
+            job.status = "running"
+            job.thread = threading.Thread(target=job._run, daemon=True)
+            st.session_state[JOB_KEY] = job
+            job.start()
             st.rerun()
-        st.caption(f"Kopie gespeichert in: {os.path.abspath(job.autosave_path)}")
+        if c2.button(_t("Stopper et garder le progrès"), key="aa_stop_from_pause", icon=":material/stop_circle:"):
+            job.request_stop()
+            st.rerun()
+        if c3.button(_t("Fermer le résultat"), key="aa_close_pause", icon=":material/close:"):
+            clear_saved_state()
+            if JOB_KEY in st.session_state:
+                del st.session_state[JOB_KEY]
+            st.rerun()
+        return
+
+    c1, c2 = st.columns(2)
+    c1.download_button(
+        f"⬇ {_t('Excel herunterladen')}", data=job.excel_bytes(),
+        file_name=os.path.basename(job.autosave_path),
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="aa_download", disabled=not job.rows, **FULL)
+    if new_job_button and c2.button(_t("Ergebnis schließen"), key="aa_close", **FULL):
+        clear_saved_state()
+        del st.session_state[JOB_KEY]
+        st.rerun()
+    st.caption(f"{_t('Kopie gespeichert in:')} {os.path.abspath(job.autosave_path)}")

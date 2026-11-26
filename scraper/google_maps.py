@@ -51,17 +51,26 @@ def places_text_search(
     api_key: str,
     max_results: int | None = None,
     log: Callable[[str], None] = print,
+    status_callback: Callable[[str, str], None] | None = None,
 ) -> list[dict]:
     """Search businesses using the SerpAPI Google Maps engine.
 
     With ``max_results=None`` every page exposed by the provider is followed; a
     caller can pass a number only when it explicitly wants a smaller retrieval.
     """
+    def report_status(status: str, message: str) -> None:
+        if status_callback is not None:
+            status_callback(status, message)
+
     if not api_key:
-        log("  [!] Google Maps: SERPAPI_KEY manquante.")
+        message = "SERPAPI_KEY manquante."
+        log(f"  [!] Google Maps: {message}")
+        report_status("failed", message)
         return []
     if not query.strip():
-        log("  [!] Google Maps: entrez un métier ou un mot-clé.")
+        message = "Entrez un métier ou un mot-clé."
+        log(f"  [!] Google Maps: {message}")
+        report_status("failed", message)
         return []
 
     limit = None if max_results is None else max(1, int(max_results))
@@ -69,6 +78,9 @@ def places_text_search(
     leads: list[dict] = []
     start = 0
     page = 0
+    status = "complete"
+    status_message = "Toutes les pages disponibles du fournisseur ont été récupérées."
+    next_page = None
 
     while (limit is None or len(leads) < limit) and page < SERPAPI_MAX_PAGES:
         params = {
@@ -84,6 +96,8 @@ def places_text_search(
             response = requests.get(SERPAPI_SEARCH_URL, params=params, timeout=30)
         except requests.RequestException as exc:
             log(f"  [!] Google Maps: erreur réseau ({exc}).")
+            status = "failed" if not leads else "incomplete"
+            status_message = "Erreur réseau pendant la recherche."
             break
 
         try:
@@ -93,13 +107,19 @@ def places_text_search(
                 log(f"  [!] Google Maps HTTP {response.status_code}: vérifiez la clé SerpAPI.")
             else:
                 log("  [!] Google Maps: réponse JSON invalide.")
+            status = "failed" if not leads else "incomplete"
+            status_message = f"Réponse HTTP/JSON invalide ({response.status_code})."
             break
 
         if data.get("error"):
             log(f"  [!] Google Maps: {data['error']}")
+            status = "failed" if not leads else "incomplete"
+            status_message = "SerpAPI a renvoyé une erreur."
             break
         if response.status_code != 200:
             log(f"  [!] Google Maps HTTP {response.status_code}: vérifiez la clé SerpAPI.")
+            status = "failed" if not leads else "incomplete"
+            status_message = f"SerpAPI a renvoyé HTTP {response.status_code}."
             break
 
         results = data.get("local_results") or []
@@ -129,8 +149,17 @@ def places_text_search(
         next_page = (data.get("serpapi_pagination") or {}).get("next")
         if not results or not next_page:
             break
+        if limit is not None and len(leads) >= limit:
+            status = "incomplete"
+            status_message = "La limite de résultats configurée a interrompu la pagination."
+            break
         start += SERPAPI_PAGE_SIZE
         page += 1
 
+    if status == "complete" and next_page and page >= SERPAPI_MAX_PAGES:
+        status = "incomplete"
+        status_message = f"La limite de {SERPAPI_MAX_PAGES} pages a interrompu la pagination."
+
     log(f"  · Google Maps: {len(leads)} résultat(s) pour « {text_query} ».")
+    report_status(status, status_message)
     return leads

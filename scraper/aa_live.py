@@ -24,10 +24,12 @@ try:
     from .leads import WebsiteEmailFinder, normalise_firma, valid_emails
     from .utils import SafeSession, is_blocked_url
     from .arbeitsagentur import search_all as verified_search_all
+    from .job_state import save as save_state, load as load_state
 except Exception:
     from leads import WebsiteEmailFinder, normalise_firma, valid_emails
     from utils import SafeSession, is_blocked_url
     from arbeitsagentur import search_all as verified_search_all
+    from job_state import save as save_state, load as load_state
 
 API_KEY = "jobboerse-jobsuche"  # clé publique utilisée par le site lui-même
 JOB_URL = "https://www.arbeitsagentur.de/jobsuche/jobdetail/{refnr}"
@@ -657,7 +659,7 @@ class ExtractionJob:
     L'état (log, rows, captcha…) est lu par l'interface toutes les secondes.
     """
 
-    def __init__(self, params, output_dir="output"):
+    def __init__(self, params, output_dir="output", resume=False):
         self.params = params
         self.status = "running"          # running | done | stopped | error
         self.total = 0
@@ -672,6 +674,21 @@ class ExtractionJob:
         self._web_finder = None
         self._site_finder = None
         self._website_cache = {}
+        self.paused = threading.Event()
+        self.resume = bool(resume)
+        self.state_path = os.path.join(output_dir, "job_states", "arbeitsagentur.json")
+        # Search results form a durable queue.  This is the important part of
+        # resume: after a restart we continue with the next offer, instead of
+        # asking every selected city and every already-completed offer again.
+        self.offers = []
+        self.next_offer_index = 0
+        self.next_location_index = 0
+        self.locations_total = 0
+        self.locations_completed = 0
+        self.current_location = ""
+        self._collection_complete = False
+        self._state_restored = False
+        self._legacy_seen_refs = set()
         self.autosave_path = os.path.join(
             output_dir, f"arbeitsagentur_{datetime.now():%Y%m%d_%H%M%S}.xlsx")
         self.thread = threading.Thread(target=self._run, daemon=True)
@@ -692,7 +709,7 @@ class ExtractionJob:
         self.captcha_event.clear()
         self.captcha_png = png
         while not self.captcha_event.wait(0.3):
-            if self.stop.is_set():
+            if self.stop.is_set() or self.paused.is_set():
                 break
         self.captcha_png = None
         return self.captcha_answer
@@ -707,7 +724,70 @@ class ExtractionJob:
 
     def request_stop(self):
         self.stop.set()
+        self.paused.set()
         self.captcha_event.set()
+        self._persist("stopped")
+
+    def request_pause(self):
+        self.paused.set()
+        # A captcha wait has no regular polling loop; wake it so the current
+        # offer can be checkpointed before the worker switches to paused.
+        self.captcha_event.set()
+        self._persist("pausing")
+        self.add_log("info", "Extraktion pausée – état sauvegardé, reprise possible plus tard.")
+
+    def _persist(self, status: str | None = None):
+        with self.lock:
+            status = status or self.status
+            data = {
+                "source": "arbeitsagentur",
+                "status": status,
+                "params": self.params,
+                "total": self.total,
+                "processed": self.processed,
+                "rows": list(self.rows),
+                "offers": list(self.offers),
+                "next_offer_index": self.next_offer_index,
+                "next_location_index": self.next_location_index,
+                "locations_total": self.locations_total,
+                "locations_completed": self.locations_completed,
+                "current_location": self.current_location,
+                "collection_complete": self._collection_complete,
+                "autosave_path": self.autosave_path,
+            }
+        try:
+            save_state("arbeitsagentur", data)
+        except Exception:
+            pass
+
+    def _restore_state(self):
+        """Restore a paused/interrupted extraction without re-searching it."""
+        state = load_state("arbeitsagentur")
+        if not state or state.get("status") == "done":
+            return False
+        self.rows = state.get("rows") or []
+        self.processed = int(state.get("processed", len(self.rows)) or 0)
+        self.offers = state.get("offers") or []
+        self.next_offer_index = int(state.get("next_offer_index", 0) or 0)
+        self.next_location_index = int(state.get("next_location_index", 0) or 0)
+        self.locations_total = int(state.get("locations_total", 0) or 0)
+        self.locations_completed = int(state.get("locations_completed", 0) or 0)
+        self.current_location = state.get("current_location", "") or ""
+        self._collection_complete = bool(state.get("collection_complete", False))
+        self.autosave_path = state.get("autosave_path", self.autosave_path)
+        self.total = int(state.get("total", len(self.offers) or len(self.rows)) or 0)
+        # Saved states created before the durable queue existed can still be
+        # resumed safely once: search again, but never process the saved refs.
+        if not self.offers:
+            self._legacy_seen_refs = {
+                str(row.get("refnr", "")) for row in self.rows if row.get("refnr")
+            }
+        self.status = "running"
+        self.add_log(
+            "info",
+            f"Reprise AA : {self.processed}/{self.total or '?'} offres déjà traitées.",
+        )
+        return True
 
     def snapshot_log(self):
         with self.lock:
@@ -729,16 +809,19 @@ class ExtractionJob:
             return self._web_finder, self._site_finder
         from .email_finder import EmailFinder
 
-        limit = max(10.0, min(120.0, float(self.params.get("website_max_seconds", 45))))
+        limit = max(10.0, min(180.0, float(self.params.get("website_max_seconds", 45))))
+        max_pages = max(2, min(20, int(self.params.get("website_max_pages", 8))))
         http = SafeSession()
         http.throttle.delay = 0.5
         self._web_finder = EmailFinder(
-            session=http, max_pages=4, log=lambda _message: None,
-            website_timeout=max(8.0, min(20.0, limit / 3)),
+            session=http, max_pages=max_pages, log=lambda _message: None,
+            api_key=(self.params.get("website_search_api_key") or "").strip(),
+            website_timeout=max(10.0, min(45.0, limit * 0.35)),
         )
         self._site_finder = WebsiteEmailFinder(
-            session=http, max_pages=4, log=lambda _message: None,
-            stop=self.stop, timeout=10, max_seconds=max(10.0, limit * 0.6),
+            session=http, max_pages=max_pages, max_scripts=8, log=lambda _message: None,
+            stop=self.stop, pause=self.paused, timeout=10,
+            max_seconds=max(10.0, limit * 0.70),
         )
         return self._web_finder, self._site_finder
 
@@ -787,6 +870,8 @@ class ExtractionJob:
             if emails:
                 self.add_log("ok", f"· E-Mail auf Website: {company} · {len(emails)}")
         website, emails, person = cached
+        if website:
+            offer["website"] = website
         if emails:
             # Keep the complete set for the live job state while retaining a
             # semicolon-separated Excel cell, as in the supplied template.
@@ -800,14 +885,86 @@ class ExtractionJob:
         locations = [l for l in (p.get("locations") or []) if l] or [""]
         year = p.get("year")
         year = None if year in (None, "", "Alle") else str(year)
-        contacts, final, seen = None, "done", set()
+        contacts, final = None, "done"
         try:
-            self.add_log("info", "Loading jobs from all pages ...")
+            if self.resume and not self._state_restored:
+                restored = self._restore_state()
+                self._state_restored = True
+            else:
+                restored = False
 
-            def on_total(n):
-                self.total += n
-                self.add_log("info", f"Total Items: ({n})")
+            self.locations_total = len(locations)
+            if not self._collection_complete:
+                if not restored:
+                    self.add_log("info", "Loading jobs from all pages ...")
 
+                # Keep both queued and already-exported refs out of a resumed
+                # city search.  The latter is only needed for legacy states
+                # saved before the durable offer queue was introduced.
+                seen = {
+                    str(offer.get("refnr", ""))
+                    for offer in self.offers
+                    if offer.get("refnr")
+                } | self._legacy_seen_refs
+
+                for location_index in range(self.next_location_index, len(locations)):
+                    if self.stop.is_set() or self.paused.is_set():
+                        break
+                    loc = locations[location_index]
+                    self.current_location = loc or "Deutschlandweit"
+                    self.locations_completed = location_index
+                    if len(locations) > 1:
+                        self.add_log("info", f"→ {loc or 'deutschlandweit'}")
+
+                    reported = []
+
+                    def on_total(n):
+                        reported.append(n)
+
+                    # The public API returns this city's complete result list.
+                    # Checkpoint it before the slow browser/email phase.
+                    city_offers = list(search_offers(
+                        p["angebotsart"], loc, p.get("was", ""), p.get("umkreis"), p.get("seit"),
+                        max_results=p.get("max_results"), stop=self.stop, on_total=on_total,
+                    ))
+                    added = 0
+                    for offer in city_offers:
+                        refnr = str(offer.get("refnr", ""))
+                        if not refnr or refnr in seen:
+                            continue
+                        seen.add(refnr)
+                        if year and year not in offer.get("beginn", ""):
+                            continue
+                        self.offers.append(offer)
+                        added += 1
+                    self.next_location_index = location_index + 1
+                    self.locations_completed = location_index + 1
+                    queued_total = len(self.offers) + (len(self.rows) if self._legacy_seen_refs else 0)
+                    self.total = max(self.total, queued_total, len(self.rows))
+                    count = reported[-1] if reported else len(city_offers)
+                    self.add_log(
+                        "info",
+                        f"✓ {loc or 'deutschlandweit'} · {added}/{count} offres mises en file",
+                    )
+                    self._persist("collecting")
+
+                if self.stop.is_set():
+                    final = "stopped"
+                    return
+                if self.paused.is_set():
+                    final = "paused"
+                    return
+                self._collection_complete = True
+                queued_total = len(self.offers) + (len(self.rows) if self._legacy_seen_refs else 0)
+                self.total = max(self.total, queued_total, len(self.rows))
+                self._persist("extracting")
+
+            if not self.offers and not self.rows:
+                self.add_log("info", "Keine passenden Angebote gefunden.")
+                return
+
+            # Start Chromium only after all selected cities have a durable
+            # queue.  A pause/restart therefore never repeats city searches.
             try:
                 contacts = BrowserContacts(self.ask_captcha, self.add_log,
                                            headed=p.get("headed", False), stop=self.stop)
@@ -818,49 +975,57 @@ class ExtractionJob:
                                     "playwright && playwright install chromium. "
                                     "Les offres sont exportées sans e-mail.")
 
-            for loc in locations:
-                if len(locations) > 1:
-                    self.add_log("info", f"→ {loc or 'deutschlandweit'}")
-                for offer in search_offers(
-                        p["angebotsart"], loc, p.get("was", ""), p.get("umkreis"), p.get("seit"),
-                        max_results=p.get("max_results"), stop=self.stop, on_total=on_total):
-                    if self.stop.is_set():
-                        raise Stopped()
-                    if offer["refnr"] in seen:
-                        continue
-                    seen.add(offer["refnr"])
-                    if year and year not in offer["beginn"]:
-                        continue         # filtre « Startjahr » avant l'étape lente
-                    if contacts:
-                        try:
-                            offer.update(contacts.fetch(offer["refnr"]))
-                        except Stopped:
-                            raise
-                        except Exception as e:
-                            self.add_log("warn", f"{offer['firma']} : erreur de lecture ({type(e).__name__})")
-                    if not offer.get("email") and p.get("website_fallback", True):
-                        try:
-                            self._fill_from_website(offer)
-                        except Stopped:
-                            raise
-                        except Exception as e:
-                            self.add_log(
-                                "warn",
-                                f"{offer['firma']} : Website-Suche fehlgeschlagen "
-                                f"({type(e).__name__})",
-                            )
-                    self.rows.append(offer)
-                    self.processed += 1
-                    if offer["email"]:
-                        emails = offer["email"]
-                        if len(emails) > 100:
-                            emails = emails[:97] + "…"
-                        self.add_log("ok", f"({self.processed}) {offer['firma']} · {emails}")
-                    else:
-                        self.add_log("ko", f"({self.processed}) {offer['firma']} · keine E-Mail")
-                    if self.processed % 10 == 0:
-                        self._save()
-                    time.sleep(0.4)
+            for offer_index in range(self.next_offer_index, len(self.offers)):
+                if self.stop.is_set() or self.paused.is_set():
+                    break
+                offer = dict(self.offers[offer_index])
+                if contacts:
+                    try:
+                        contacts_result = contacts.fetch(offer["refnr"])
+                        offer.update(contacts_result)
+                    except Stopped:
+                        raise
+                    except Exception as e:
+                        self.add_log("warn", f"{offer['firma']} : erreur de lecture ({type(e).__name__})")
+                if not offer.get("email") and p.get("website_fallback", True):
+                    try:
+                        self._fill_from_website(offer)
+                    except Stopped:
+                        raise
+                    except Exception as e:
+                        self.add_log(
+                            "warn",
+                            f"{offer['firma']} : Website-Suche fehlgeschlagen "
+                            f"({type(e).__name__})",
+                        )
+                self.rows.append(offer)
+                self.next_offer_index = offer_index + 1
+                self.processed += 1
+                if offer.get("email"):
+                    emails = offer["email"]
+                    if len(emails) > 100:
+                        emails = emails[:97] + "…"
+                    self.add_log("ok", f"({self.processed}) {offer['firma']} · {emails}")
+                elif offer.get("website"):
+                    self.add_log(
+                        "warn",
+                        f"({self.processed}) {offer['firma']} · keine veröffentlichte E-Mail nach Website-Prüfung",
+                    )
+                else:
+                    self.add_log("info", f"({self.processed}) {offer['firma']} · keine offizielle Website gefunden")
+                self._persist("extracting")
+                if self.processed % 10 == 0:
+                    self._save()
+                time.sleep(0.4)
+
+            if self.stop.is_set():
+                final = "stopped"
+            elif self.paused.is_set():
+                final = "paused"
+            elif self.next_offer_index < len(self.offers):
+                final = "paused"
+            else:
+                final = "done"
         except Stopped:
             self.add_log("err", "Process stopped by user")
             final = "stopped"
@@ -871,4 +1036,5 @@ class ExtractionJob:
             if contacts:
                 contacts.close()
             self._save()
-            self.status = final          # en dernier : "terminé" seulement une fois le fichier écrit
+            self.status = final          # only completed after the file/state write
+            self._persist(final)
