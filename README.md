@@ -40,6 +40,19 @@ Add that PC's own API key to `.streamlit\secrets.toml`, then run
 `d-old-version` and rebuild. The `output/` data and secrets are local to each
 PC and are not uploaded or synchronized by GitHub.
 
+## Windows installer (no Docker or Git required)
+
+The GitHub Actions workflow builds a per-user Windows installer containing
+Python and Chromium. Download
+[`SCRAPPER-Setup.exe`](https://github.com/hakimo-0/Web-Scraping-System/releases/download/d-old-version-latest/SCRAPPER-Setup.exe)
+from the latest `d-old-version` release and run it. The installer creates a
+desktop shortcut; launch SCRAPPER from there. It does not require Docker, Git,
+or a system-wide Python installation.
+
+When new code is pushed to `d-old-version`, GitHub rebuilds the installer.
+Download and run the new installer to update the app; local `output/` data and
+`.streamlit/secrets.toml` are not included in the installer and are preserved.
+
 The Google key is never placed in exported spreadsheets. Do not commit
 `.streamlit/secrets.toml`, `.env`, or `config.json`.
 

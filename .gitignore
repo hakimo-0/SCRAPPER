@@ -12,6 +12,7 @@ __pycache__/
 *.db
 *.log
 .pytest_cache/
+build/
 err.txt
 out.txt
 tmp_append.txt
