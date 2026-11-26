@@ -13,7 +13,7 @@ DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64
 ArchitecturesInstallIn64BitMode=x64
-OutputDir=build\installer
+OutputDir=..\build\installer
 OutputBaseFilename=SCRAPPER-Setup
 Compression=lzma2/ultra64
 SolidCompression=yes
@@ -21,7 +21,7 @@ WizardStyle=modern
 UninstallDisplayName=SCRAPPER
 
 [Files]
-Source: "build\stage\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\build\stage\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{autoprograms}\SCRAPPER"; Filename: "{app}\start_scrapper.bat"; WorkingDir: "{app}"
