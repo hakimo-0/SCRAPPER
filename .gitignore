@@ -1,0 +1,17 @@
+# Local credentials and generated files
+.streamlit/secrets.toml
+.env
+config.json
+output/
+debug/
+HOME/
+__pycache__/
+*.py[cod]
+*.sqlite
+*.sqlite3
+*.db
+*.log
+.pytest_cache/
+err.txt
+out.txt
+tmp_append.txt
