@@ -75,6 +75,41 @@ jobs:
           & $compiler "/DAppVersion=$env:APP_VERSION" "installer\SCRAPPER.iss"
           if ($LASTEXITCODE -ne 0) { throw "Inno Setup compilation failed." }
 
+      - name: Install and smoke-test setup
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installer = Join-Path $env:GITHUB_WORKSPACE "build\installer\SCRAPPER-Setup.exe"
+          $installDir = Join-Path $env:RUNNER_TEMP "scrapper-installed"
+          $setup = Start-Process -FilePath $installer `
+            -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/DIR=$installDir") `
+            -Wait -PassThru
+          if ($setup.ExitCode -ne 0) { throw "Setup.exe installation failed with $($setup.ExitCode)." }
+
+          $env:PLAYWRIGHT_BROWSERS_PATH = Join-Path $installDir "ms-playwright"
+          $app = Start-Process -FilePath (Join-Path $installDir "python\python.exe") `
+            -ArgumentList @("-m", "streamlit", "run", "streamlit_app.py",
+              "--server.address=127.0.0.1", "--server.port=18501", "--server.headless=true") `
+            -WorkingDirectory $installDir -PassThru -WindowStyle Hidden
+          $ready = $false
+          try {
+            for ($attempt = 0; $attempt -lt 60; $attempt++) {
+              if ($app.HasExited) { throw "Installed app exited before becoming healthy." }
+              try {
+                $response = Invoke-WebRequest -UseBasicParsing `
+                  "http://127.0.0.1:18501/_stcore/health" -TimeoutSec 5
+                if ($response.StatusCode -eq 200 -and $response.Content -eq "ok") {
+                  $ready = $true
+                  break
+                }
+              } catch {}
+              Start-Sleep -Seconds 2
+            }
+            if (-not $ready) { throw "Installed app did not become healthy." }
+          } finally {
+            Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue
+          }
+
       - name: Publish latest installer
         shell: pwsh
         env:
