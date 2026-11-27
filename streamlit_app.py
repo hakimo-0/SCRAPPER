@@ -290,10 +290,10 @@ def source_settings(source_id: str) -> dict:
             locations = st.text_input("Ort/PLZ (optional)", key="az_locations", placeholder="z. B. Köln, Dortmund")
         with third:
             max_pages = st.number_input(
-                "Max. Seiten je Ort", min_value=1, max_value=20, value=4, step=1,
-                key="az_max_pages", help="15 Angebote pro Seite.",
+                "Max. Seiten je Ort", min_value=1, max_value=250, value=250, step=1,
+                key="az_max_pages_v2", help="15 Angebote pro Seite. Die Suche endet früher, wenn Azubiyo keine weitere Seite liefert.",
             )
-        st.caption("Azubiyo liefert 15 Angebote pro Seite. Weitere Seiten werden über die öffentliche ResultsMoreByUrl-Schnittstelle der Seite geladen.")
+        st.caption("Die Suche lädt weitere Seiten über Azubiyo. Die Trefferzahl auf der Website kann höher sein als die Angebote, die deren öffentliche Seitenschnittstelle zurückgibt.")
         return {
             "keyword": keyword.strip(), "locations": split_locations(locations),
             "max_pages": int(max_pages),

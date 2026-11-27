@@ -30,6 +30,12 @@ def test_parse_cards_extracts_company_location_and_start():
     assert lead["url"].endswith("/stellenanzeigen/ausbildung-elektroniker_acme_abc123/")
 
 
+def test_parse_advertised_total_uses_german_thousands_separator():
+    assert azubiyo._parse_advertised_total(
+        "<h2>3.563 Ausbildungs- und Studienangebote</h2>"
+    ) == 3563
+
+
 class _Response:
     status_code = 200
 
@@ -68,6 +74,22 @@ def test_search_follows_more_results_endpoint():
     assert [lead["name"] for lead in leads] == ["ACME GmbH", "ACME GmbH"]
     assert leads[1]["title"] == "Ausbildung Mechatroniker (m/w/d)"
     assert leads[1]["url"].endswith("def456/")
+
+
+def test_search_reports_when_public_pagination_returns_fewer_than_site_count():
+    logs = []
+
+    with patch("scraper.azubiyo.time.sleep"):
+        leads = azubiyo.search(
+            "Pflegefachmann/-frau",
+            "",
+            max_pages=250,
+            http=_Http("<h2>3.563 Ausbildungs- und Studienangebote</h2>" + CARD),
+            log=logs.append,
+        )
+
+    assert len(leads) == 1
+    assert any("3.563 Treffer" in message and "nur 1 geladen" in message for message in logs)
 
 
 def test_city_slug_handles_umlauts():

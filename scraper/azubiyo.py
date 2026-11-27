@@ -18,7 +18,7 @@ from .utils import SafeSession, normalize, soup_of
 BASE = "https://www.azubiyo.de"
 MORE_URL = f"{BASE}/umbraco/surface/JobList22/ResultsMoreByUrl/"
 DEFAULT_RADIUS = 25
-DEFAULT_MAX_PAGES = 20
+DEFAULT_MAX_PAGES = 250
 
 CITY_ALIASES = {
     "frankfurt am main": "frankfurt", "frankfurt": "frankfurt",
@@ -117,6 +117,19 @@ def _parse_cards(html: str, city_hint: str = "") -> list[dict]:
     return leads
 
 
+def _parse_advertised_total(html: str) -> int | None:
+    """Read the result count shown by Azubiyo's search page, when available."""
+    for heading in soup_of(html).select("h1, h2, h3"):
+        match = re.search(
+            r"([\d.]+)\s+(?:Ausbildungs- und Studienangebote|Stellenangebote|Angebote)\b",
+            _text(heading),
+            re.IGNORECASE,
+        )
+        if match:
+            return int(match.group(1).replace(".", ""))
+    return None
+
+
 def _session(http=None):
     return http or SafeSession()
 
@@ -193,6 +206,7 @@ def search(
         log(f"  [!] AzubiYo: keine Angebote für «{keyword or city}».")
         return []
 
+    advertised_total = _parse_advertised_total(html)
     seen = {lead["url"] for lead in leads}
     page = 1
     while len(leads) < (max_results or 10**9) and page < max_pages:
@@ -213,6 +227,14 @@ def search(
     if page >= max_pages and len(leads) < (max_results or 10**9):
         log(f"  · AzubiYo: Seitenlimit ({max_pages}) erreicht.")
     log(f"  · AzubiYo: {len(leads)} Angebote für «{keyword or 'alle'}» / «{city or 'deutschlandweit'}».")
+    if advertised_total and len(leads) < advertised_total and (
+        max_results is None or len(leads) < max_results
+    ):
+        formatted_total = f"{advertised_total:,}".replace(",", ".")
+        log(
+            f"  [!] AzubiYo: Die Website zeigt {formatted_total} Treffer; "
+            f"über die öffentliche Seitenschnittstelle wurden nur {len(leads)} geladen."
+        )
     return leads[:max_results] if max_results is not None else leads
 
 

@@ -79,7 +79,9 @@ The Google key is never placed in exported spreadsheets. Do not commit
   its own progress, captcha (Jobbörse only), result panel, and Excel file.
 - **Azubiyo:** public `/stellenmarkt/` search by profession, city, and radius.
   Further result pages come from Azubiyo's own `ResultsMoreByUrl` endpoint
-  (15 offers per page), so a search is not limited to the first screen.
+  (15 offers per page). The app requests up to the configured page limit and
+  reports when the public endpoint returns fewer offers than the result count
+  displayed on the site.
 - **Ausbildung.de:** public `/suche/` search by profession and city (20 cards
   per query). With no keyword/city the connector reads the A–Z company
   directory instead. Employer websites are taken from the company/job pages
